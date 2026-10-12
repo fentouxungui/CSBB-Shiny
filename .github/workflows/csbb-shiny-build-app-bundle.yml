@@ -26,7 +26,9 @@
 #     minus the stripped dev-only packages (devtools, usethis).
 #   * Mix of CRAN and Bioconductor (RUVSeq, M3C, DESeq2, ReactomePA, clusterProfiler,
 #     ChIPseeker, EnhancedVolcano, scater, MAST, org.*.eg.db, TxDb.*); all resolved
-#     via BiocManager::repositories() and installed as binaries.
+#     via BiocManager::repositories(). Installed in two passes: prebuilt
+#     binaries first, then a source fallback for packages that have no binary
+#     for the pinned R release (the Bioconductor annotation/data set).
 #   * enrichR is now on CRAN (v3.4), so no devtools::install_github() is required.
 #   * `zscore()` used by app_bin/Zscore_Norm.r comes from dtwclust (in the seed).
 #   * base-priority packages are excluded from the closure; recommended ones
@@ -156,16 +158,35 @@ jobs:
           closure <- setdiff(closure, base_pkgs)
           closure <- closure[closure %in% rownames(db)]
           cat("closure packages to install:", length(closure), "\n")
-          if (length(closure)) {
-            install.packages(closure, lib = lib, repos = repos, type = "binary",
+          install_into <- function(pkgs, type) {
+            if (!length(pkgs)) return(invisible())
+            install.packages(pkgs, lib = lib, repos = repos, type = type,
                              dependencies = FALSE, Ncpus = 2)
           }
+          lib_pkgs <- function() basename(list.dirs(lib, recursive = FALSE))
 
-          present <- basename(list.dirs(lib, recursive = FALSE))
+          # Pass 1: prebuilt binaries (CRAN/Posit + Bioconductor where available).
+          install_into(closure, "binary")
+          pkgs_present <- lib_pkgs()
+
+          # Pass 2: source fallback. Bioconductor annotation/data packages
+          # (org.*.eg.db, TxDb.*, GO.db, reactome.db) are frequently missing as
+          # Windows/macOS binaries for a brand-new R release -- exactly what
+          # `type = "binary"` alone would skip. They are pure R
+          # (NeedsCompilation: no), so a source install needs no toolchain.
+          no_binary <- setdiff(closure, pkgs_present)
+          if (length(no_binary)) {
+            cat("no binary available, installing from source:", length(no_binary), "\n")
+            install_into(no_binary, "source")
+            pkgs_present <- lib_pkgs()
+          }
+
           required <- setdiff(seed, base_pkgs)
-          missing <- setdiff(required, present)
+          missing <- setdiff(required, pkgs_present)
           if (length(missing)) stop("packages missing from rlib: ", paste(missing, collapse = ", "))
-          cat("rlib packages:", length(present), "\n")
+          still_dep <- setdiff(closure, pkgs_present)
+          if (length(still_dep)) cat("WARNING: closure packages still missing:", paste(still_dep, collapse = ", "), "\n")
+          cat("rlib packages:", length(pkgs_present), "\n")
 
           # --- 4. write manifest.json ---------------------------------------
           pkgs <- as.data.frame(installed.packages(lib.loc = lib))
