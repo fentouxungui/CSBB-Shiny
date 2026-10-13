@@ -150,43 +150,81 @@ jobs:
                     "clusterProfiler", "cowplot", "scater", "MAST", "Seurat",
                     "shinycssloaders", "shinyWidgets", "hdf5r", "enrichR", "DT")
 
-          db <- available.packages(repos = repos)
-          cat("available packages:", nrow(db), "\n")
+          # Dependency graph from the SOURCE index, not the binary index: on a
+          # brand-new R release the binary PACKAGES index is incomplete, and a
+          # binary-only index silently drops dependency edges (this is how
+          # ReactomePA -> enrichplot -> fgsea was missed before). The source
+          # index always lists every package and its declared dependencies.
+          db <- available.packages(repos = repos, type = "source")
+          cat("available packages (source index):", nrow(db), "\n")
+          base_pkgs <- rownames(installed.packages(priority = "base"))
           closure <- unique(c(seed,
                      unlist(tools::package_dependencies(seed, db = db, recursive = TRUE))))
-          base_pkgs <- rownames(installed.packages(priority = "base"))
           closure <- setdiff(closure, base_pkgs)
           closure <- closure[closure %in% rownames(db)]
           cat("closure packages to install:", length(closure), "\n")
+
+          lib_pkgs <- function() basename(list.dirs(lib, recursive = FALSE))
           install_into <- function(pkgs, type) {
             if (!length(pkgs)) return(invisible())
             install.packages(pkgs, lib = lib, repos = repos, type = type,
                              dependencies = FALSE, Ncpus = 2)
           }
-          lib_pkgs <- function() basename(list.dirs(lib, recursive = FALSE))
-
-          # Pass 1: prebuilt binaries (CRAN/Posit + Bioconductor where available).
-          install_into(closure, "binary")
-          pkgs_present <- lib_pkgs()
-
-          # Pass 2: source fallback. Bioconductor annotation/data packages
-          # (org.*.eg.db, TxDb.*, GO.db, reactome.db) are frequently missing as
-          # Windows/macOS binaries for a brand-new R release -- exactly what
-          # `type = "binary"` alone would skip. They are pure R
-          # (NeedsCompilation: no), so a source install needs no toolchain.
-          no_binary <- setdiff(closure, pkgs_present)
-          if (length(no_binary)) {
-            cat("no binary available, installing from source:", length(no_binary), "\n")
-            install_into(no_binary, "source")
-            pkgs_present <- lib_pkgs()
+          # Two passes: prebuilt binaries first, then a source fallback for
+          # packages with no binary for this R release (the Bioconductor
+          # annotation/data set, and any compiled package not yet built).
+          install_two_pass <- function(pkgs) {
+            install_into(pkgs, "binary")
+            left <- setdiff(pkgs, lib_pkgs())
+            if (length(left)) {
+              cat("source fallback for", length(left), "package(s) with no binary\n")
+              install_into(left, "source")
+            }
           }
 
-          required <- setdiff(seed, base_pkgs)
-          missing <- setdiff(required, pkgs_present)
-          if (length(missing)) stop("packages missing from rlib: ", paste(missing, collapse = ", "))
-          still_dep <- setdiff(closure, pkgs_present)
-          if (length(still_dep)) cat("WARNING: closure packages still missing:", paste(still_dep, collapse = ", "), "\n")
+          install_two_pass(closure)
+
+          # --- 3b. closure repair loop --------------------------------------
+          # Read the ACTUAL installed DESCRIPTIONs and pull in any transitive
+          # dependency the repo-index closure missed. This is authoritative
+          # (it uses the versions that are really in rlib) and independent of
+          # repo-index completeness.
+          get_deps <- function(p) {
+            d <- utils::packageDescription(p, lib.loc = lib)
+            if (is.null(d)) return(character())
+            f <- paste(c(d$Depends, d$Imports, d$LinkingTo), collapse = ",")
+            f <- gsub("\\([^)]*\\)", "", f)
+            pk <- trimws(unlist(strsplit(f, ",")))
+            setdiff(pk[nzchar(pk)], c("R", base_pkgs))
+          }
+          for (iter in 1:8) {
+            pkgs_present <- lib_pkgs()
+            need <- unique(unlist(lapply(pkgs_present, get_deps)))
+            need <- setdiff(need, pkgs_present)
+            unresolvable <- setdiff(need, rownames(db))
+            if (length(unresolvable))
+              cat("WARNING: dependencies not in any repo index:", paste(unresolvable, collapse = ", "), "\n")
+            need <- intersect(need, rownames(db))
+            if (!length(need)) break
+            cat("repair iteration", iter, "- installing", length(need), "missing dependency(ies)\n")
+            install_two_pass(need)
+          }
+          pkgs_present <- lib_pkgs()
           cat("rlib packages:", length(pkgs_present), "\n")
+
+          # --- 3c. verify the seed packages actually LOAD from rlib ---------
+          # A missing transitive dependency (e.g. fgsea) only shows up at
+          # namespace-load time, so assert it here rather than at first launch.
+          old_libpaths <- .libPaths()
+          .libPaths(c(lib, old_libpaths))
+          hard <- setdiff(seed, base_pkgs)
+          bad <- hard[!vapply(hard, function(p)
+                   suppressWarnings(requireNamespace(p, lib.loc = lib, quietly = TRUE)),
+                   logical(1))]
+          .libPaths(old_libpaths)
+          if (length(bad)) stop("seed packages failed to load from rlib: ", paste(bad, collapse = ", "))
+          cat("all", length(hard), "seed packages load from rlib\n")
+
 
           # --- 4. write manifest.json ---------------------------------------
           pkgs <- as.data.frame(installed.packages(lib.loc = lib))
