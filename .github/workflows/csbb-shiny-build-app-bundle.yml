@@ -135,10 +135,15 @@ jobs:
 
           # --- 3. install the dependency closure into bundle/rlib -----------
           repos <- BiocManager::repositories()
-          options(repos = repos)
+          options(repos = repos, timeout = 3600)
+          # "both" = prefer a prebuilt binary, fall back to SOURCE per package.
+          # Several Bioconductor annotation/data packages (GO.db, reactome.db,
+          # org.*.eg.db, TxDb.*) have NO binary for a brand-new R release and
+          # MUST be built from source; forcing type="binary" silently drops
+          # them, which then breaks clusterProfiler / ChIPseeker / ReactomePA.
+          options(pkgType = "both")
 
-          # Top-level library()/require() in app.R + DT::, minus the stripped
-          # dev-only packages (devtools, usethis).
+          base_pkgs <- rownames(installed.packages(priority = "base"))
           seed <- c("shiny", "servr", "ggplot2", "pheatmap", "M3C", "RUVSeq",
                     "scales", "dtwclust", "dplyr", "DESeq2", "ggcorrplot", "tibble",
                     "ReactomePA", "org.Hs.eg.db", "org.Mm.eg.db", "AnnotationDbi",
@@ -150,14 +155,11 @@ jobs:
                     "clusterProfiler", "cowplot", "scater", "MAST", "Seurat",
                     "shinycssloaders", "shinyWidgets", "hdf5r", "enrichR", "DT")
 
-          # Dependency graph from the SOURCE index, not the binary index: on a
-          # brand-new R release the binary PACKAGES index is incomplete, and a
-          # binary-only index silently drops dependency edges (this is how
-          # ReactomePA -> enrichplot -> fgsea was missed before). The source
-          # index always lists every package and its declared dependencies.
+          # Full dependency graph from the SOURCE index (always complete; the
+          # binary index is incomplete on a new R release and silently drops
+          # dependency edges).
           db <- available.packages(repos = repos, type = "source")
           cat("available packages (source index):", nrow(db), "\n")
-          base_pkgs <- rownames(installed.packages(priority = "base"))
           closure <- unique(c(seed,
                      unlist(tools::package_dependencies(seed, db = db, recursive = TRUE))))
           closure <- setdiff(closure, base_pkgs)
@@ -165,30 +167,20 @@ jobs:
           cat("closure packages to install:", length(closure), "\n")
 
           lib_pkgs <- function() basename(list.dirs(lib, recursive = FALSE))
-          install_into <- function(pkgs, type) {
+          # Let R resolve and order the graph, choosing binary vs source per
+          # package (dependencies = NA = Depends + Imports + LinkingTo).
+          install_pkgs <- function(pkgs, type = "both") {
             if (!length(pkgs)) return(invisible())
-            install.packages(pkgs, lib = lib, repos = repos, type = type,
-                             dependencies = FALSE, Ncpus = 2)
-          }
-          # Two passes: prebuilt binaries first, then a source fallback for
-          # packages with no binary for this R release (the Bioconductor
-          # annotation/data set, and any compiled package not yet built).
-          install_two_pass <- function(pkgs) {
-            install_into(pkgs, "binary")
-            left <- setdiff(pkgs, lib_pkgs())
-            if (length(left)) {
-              cat("source fallback for", length(left), "package(s) with no binary\n")
-              install_into(left, "source")
-            }
+            install.packages(pkgs, lib = lib, repos = repos,
+                             dependencies = NA, type = type, Ncpus = 2)
           }
 
-          install_two_pass(closure)
+          install_pkgs(closure)
+          cat("after first install, rlib packages:", length(lib_pkgs()), "\n")
 
           # --- 3b. closure repair loop --------------------------------------
-          # Read the ACTUAL installed DESCRIPTIONs and pull in any transitive
-          # dependency the repo-index closure missed. This is authoritative
-          # (it uses the versions that are really in rlib) and independent of
-          # repo-index completeness.
+          # Use the ACTUAL installed DESCRIPTIONs to close any transitive gap
+          # the repo-index closure missed (authoritative + index-independent).
           get_deps <- function(p) {
             d <- utils::packageDescription(p, lib.loc = lib)
             if (is.null(d)) return(character())
@@ -207,22 +199,40 @@ jobs:
             need <- intersect(need, rownames(db))
             if (!length(need)) break
             cat("repair iteration", iter, "- installing", length(need), "missing dependency(ies)\n")
-            install_two_pass(need)
+            install_pkgs(need)
+          }
+
+          # --- 3c. force-SOURCE retry for anything still missing -------------
+          # The binary-less set is exactly the Bioconductor annotation/data
+          # packages; ensure they land by installing them explicitly from source.
+          still <- setdiff(closure, lib_pkgs())
+          if (length(still)) {
+            cat("retrying", length(still), "package(s) from source:",
+                paste(still, collapse = ", "), "\n")
+            install_pkgs(still, type = "source")
           }
           pkgs_present <- lib_pkgs()
           cat("rlib packages:", length(pkgs_present), "\n")
+          ann <- c("GO.db", "reactome.db", "org.Hs.eg.db", "org.Mm.eg.db",
+                   "TxDb.Hsapiens.UCSC.hg19.knownGene", "TxDb.Mmusculus.UCSC.mm10.knownGene",
+                   "TxDb.Hsapiens.UCSC.hg38.knownGene", "TxDb.Mmusculus.UCSC.mm9.knownGene")
+          cat("annotation/data present:", paste(intersect(ann, pkgs_present), collapse = ", "), "\n")
+          cat("annotation/data MISSING:", paste(setdiff(ann, pkgs_present), collapse = ", "), "\n")
 
-          # --- 3c. verify the seed packages actually LOAD from rlib ---------
-          # A missing transitive dependency (e.g. fgsea) only shows up at
-          # namespace-load time, so assert it here rather than at first launch.
+          # --- 3d. verify the seed packages actually LOAD from rlib ---------
           old_libpaths <- .libPaths()
           .libPaths(c(lib, old_libpaths))
           hard <- setdiff(seed, base_pkgs)
-          bad <- hard[!vapply(hard, function(p)
-                   suppressWarnings(requireNamespace(p, lib.loc = lib, quietly = TRUE)),
-                   logical(1))]
+          errs <- character()
+          for (p in hard) {
+            tryCatch(loadNamespace(p, lib.loc = lib),
+                     error = function(e) { errs[[p]] <<- conditionMessage(e) })
+          }
           .libPaths(old_libpaths)
-          if (length(bad)) stop("seed packages failed to load from rlib: ", paste(bad, collapse = ", "))
+          if (length(errs)) {
+            for (p in names(errs)) cat("LOAD FAILED:", p, "\n   ", errs[[p]], "\n")
+            stop("seed packages failed to load from rlib: ", paste(names(errs), collapse = ", "))
+          }
           cat("all", length(hard), "seed packages load from rlib\n")
 
 
