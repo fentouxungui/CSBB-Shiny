@@ -40,6 +40,10 @@
 #   * Windows HDF5: the Single Cell module uses hdf5r (HDF5 1.12 stack). The
 #     store README flags this as a known Windows limitation; the bundle pins the
 #     CRAN binary so `.h5` input works where the runtime supports it.
+#   * macOS XQuartz: gdtools (via enrichplot -> ggtree -> ggiraph) ships as a
+#     binary linked against XQuartz; it is rebuilt from source with a static
+#     cairo, and the bundle is audited so no /opt/X11, /opt/homebrew or
+#     /usr/local/opt load paths remain.
 #   * BUNDLE SIZE: the Bioconductor annotation set (4 x TxDb.*, org.Hs/Mm.eg.db)
 #     plus Seurat/MAST/scater makes this the heaviest app in the catalog. Keep an
 #     eye on the 2 GiB per-asset GitHub Release limit; see the size guard below.
@@ -219,7 +223,30 @@ jobs:
           cat("annotation/data present:", paste(intersect(ann, pkgs_present), collapse = ", "), "\n")
           cat("annotation/data MISSING:", paste(setdiff(ann, pkgs_present), collapse = ", "), "\n")
 
-          # --- 3d. verify the seed packages actually LOAD from rlib ---------
+          # --- 3d. macOS: make gdtools self-contained (no XQuartz) ------------
+          # gdtools' CRAN macOS binary links XQuartz is reachable via
+          # enrichplot -> ggtree -> ggiraph -> gdtools, and that binary hardlinks
+          # /opt/X11/lib/libXrender.1.dylib -- absent on CI runners AND on end-user
+          # Macs. Rebuild gdtools from source using its configure's self-contained
+          # static 'autobrew' cairo: hide Homebrew from PATH so neither brew cairo nor
+          # pkg-config (both XQuartz-based) is picked up.
+          if (Sys.info()[["sysname"]] == "Darwin") {
+            unlink(file.path(lib, "gdtools"), recursive = TRUE)
+            old_path <- Sys.getenv("PATH")
+            Sys.setenv(PATH = paste(file.path(R.home("bin")),
+                                    "/usr/bin", "/bin", "/usr/sbin", "/sbin", sep = ":"))
+            install.packages("gdtools", lib = lib, repos = repos,
+                             type = "source", dependencies = FALSE)
+            Sys.setenv(PATH = old_path)
+            gso <- file.path(lib, "gdtools", "libs", "gdtools.so")
+            if (!file.exists(gso)) stop("gdtools source build failed on macOS")
+            ot <- suppressWarnings(system2("otool", c("-L", gso), stdout = TRUE, stderr = TRUE))
+            ext <- grep("^[[:space:]]*/opt/|^[[:space:]]*/usr/local/", ot, value = TRUE)
+            if (length(ext)) stop("gdtools still links non-portable libraries:\n", paste(ext, collapse = "\n"))
+            cat("gdtools rebuilt from source and is self-contained\n")
+          }
+
+          # --- 3e. verify the seed packages actually LOAD from rlib ---------
           old_libpaths <- .libPaths()
           .libPaths(c(lib, old_libpaths))
           hard <- setdiff(seed, base_pkgs)
@@ -258,6 +285,19 @@ jobs:
               path = file.path("rlib", pkgs$Package[i]), source = "cran"))
           )
           jsonlite::write_json(man, file.path(bundle, "manifest.json"), pretty = TRUE, auto_unbox = TRUE)
+
+      - name: Audit macOS bundle for non-portable library paths
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          hits=""
+          while IFS= read -r f; do
+            lines=$(otool -L "$f" 2>/dev/null | grep -E '/opt/X11|/opt/homebrew|/usr/local/opt' || true)
+            if [ -n "$lines" ]; then hits="$hits$f\n$lines\n"; fi
+          done < <(find bundle/rlib -type f \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null)
+          if [ -n "$hits" ]; then printf 'Non-portable library references found:\n%b\n' "$hits"; exit 1; fi
+          echo "portability audit: clean"
 
       - name: Zip + sha256
         shell: Rscript {0}
